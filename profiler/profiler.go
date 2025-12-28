@@ -3,6 +3,7 @@ package profiler
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/yourusername/s3-profiler/output"
@@ -77,34 +78,84 @@ func (p *Profiler) ProfileBucket(ctx context.Context, bucketName, region string)
 	return nil
 }
 
-// ProfileMultipleBuckets profiles multiple S3 buckets
+// ProfileMultipleBuckets profiles multiple S3 buckets concurrently using a worker pool
 func (p *Profiler) ProfileMultipleBuckets(ctx context.Context, bucketNames []string, getRegion func(context.Context, string) (string, error)) error {
 	totalBuckets := len(bucketNames)
-	successCount := 0
-	failedBuckets := []string{}
 
-	fmt.Printf("Profiling %d bucket(s)...\n", totalBuckets)
+	// Thread-safe counters and state
+	var (
+		mu            sync.Mutex
+		successCount  int
+		failedBuckets []string
+		processedCount int
+	)
 
-	for i, bucketName := range bucketNames {
-		fmt.Printf("\n[%d/%d] Processing bucket: %s\n", i+1, totalBuckets, bucketName)
+	fmt.Printf("Profiling %d bucket(s) concurrently...\n", totalBuckets)
 
-		// Get bucket region
-		region, err := getRegion(ctx, bucketName)
-		if err != nil {
-			fmt.Printf("ERROR: Failed to get region for bucket %s: %v\n", bucketName, err)
-			failedBuckets = append(failedBuckets, bucketName)
-			continue
-		}
-
-		// Profile the bucket
-		if err := p.ProfileBucket(ctx, bucketName, region); err != nil {
-			fmt.Printf("ERROR: Failed to profile bucket %s: %v\n", bucketName, err)
-			failedBuckets = append(failedBuckets, bucketName)
-			continue
-		}
-
-		successCount++
+	// Configure worker pool size (max 5 concurrent buckets to avoid AWS rate limiting)
+	maxWorkers := 5
+	if totalBuckets < maxWorkers {
+		maxWorkers = totalBuckets
 	}
+
+	// Create channels
+	bucketChan := make(chan string, totalBuckets)
+	var wg sync.WaitGroup
+
+	// Start worker pool
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			for bucketName := range bucketChan {
+				// Get bucket region
+				region, err := getRegion(ctx, bucketName)
+				if err != nil {
+					mu.Lock()
+					processedCount++
+					fmt.Printf("\n[%d/%d] ERROR: Failed to get region for bucket %s: %v\n",
+						processedCount, totalBuckets, bucketName, err)
+					failedBuckets = append(failedBuckets, bucketName)
+					mu.Unlock()
+					continue
+				}
+
+				// Update progress
+				mu.Lock()
+				processedCount++
+				currentCount := processedCount
+				mu.Unlock()
+
+				fmt.Printf("\n[%d/%d] Worker %d: Processing bucket: %s\n",
+					currentCount, totalBuckets, workerID+1, bucketName)
+
+				// Profile the bucket
+				if err := p.ProfileBucket(ctx, bucketName, region); err != nil {
+					mu.Lock()
+					fmt.Printf("ERROR: Worker %d failed to profile bucket %s: %v\n",
+						workerID+1, bucketName, err)
+					failedBuckets = append(failedBuckets, bucketName)
+					mu.Unlock()
+					continue
+				}
+
+				// Increment success counter
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(i)
+	}
+
+	// Send all bucket names to the channel
+	for _, bucketName := range bucketNames {
+		bucketChan <- bucketName
+	}
+	close(bucketChan)
+
+	// Wait for all workers to complete
+	wg.Wait()
 
 	// Print summary
 	fmt.Printf("\n%s\n", output.FormatHeader("Summary"))
